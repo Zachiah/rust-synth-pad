@@ -1,0 +1,187 @@
+mod coordinate_conversion;
+
+use std::sync::{Arc, Mutex};
+
+use bevy::{prelude::*, sprite::MaterialMesh2dBundle, window::PrimaryWindow};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+#[derive(Resource)]
+struct AudioResource {
+    data: Arc<Mutex<AudioData>>,
+}
+
+struct AudioData(Vec<Pitch>);
+
+#[derive(Clone, Component)]
+struct Pitch {
+    frequency: f32,
+    volume: f32,
+    phase_accumulator: f32,
+}
+
+#[derive(Resource)]
+struct PitchCreationState {
+    is_adding_pitch: bool,
+}
+
+#[derive(Event)]
+struct PitchesChanged {}
+
+impl Pitch {
+    fn advance(&mut self, sample_rate: f32) {
+        self.phase_accumulator += (self.frequency / sample_rate) * 2.0 * std::f32::consts::PI;
+        if self.phase_accumulator >= 2.0 * std::f32::consts::PI {
+            self.phase_accumulator -= 2.0 * std::f32::consts::PI;
+        }
+    }
+
+    fn sine_wave(&self, sample_rate: f32) -> f32 {
+        (std::f32::consts::PI * 2.0 * self.phase_accumulator * self.frequency / sample_rate).sin()
+            * self.volume
+    }
+}
+
+fn interpolate(old: f32, new: f32, progress: f32) -> f32 {
+    old + ((new - old) * progress)
+}
+
+fn plus_half_steps(pitch: f32, half_steps: f32) -> f32 {
+    pitch * (2.0f32).powf(half_steps / 12.0)
+}
+
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut meshes: ResMut<Assets<Mesh>>) {
+    commands.spawn(Camera2dBundle::default());
+}
+
+fn keep_pitches_in_sync(
+    mut pitches_changed_evs: EventReader<PitchesChanged>,
+    audio_resource: Res<AudioResource>,
+    pitch_components: Query<&Pitch>,
+) {
+    for ev in pitches_changed_evs.read() {
+        audio_resource.data.lock().unwrap().0 =
+            pitch_components.iter().map(|p| p.clone()).collect();
+    }
+}
+
+fn handle_mouse(
+    mut commands: Commands,
+    buttons: Res<Input<MouseButton>>,
+    keyboard: Res<Input<KeyCode>>,
+    q_windows: Query<&Window, With<PrimaryWindow>>,
+    pitch_components: Query<(Entity, &Pitch, &Transform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    camera_transform: Query<&Transform, With<Camera>>,
+    camera_projection: Query<&OrthographicProjection, With<Camera>>,
+    mut pitch_changed_writer: EventWriter<PitchesChanged>,
+    mut pitch_creation_state: Res<PitchCreationState>,
+) {
+    if keyboard.just_pressed(KeyCode::Q) {
+        pitch_creation_state.is_adding_pitch = false;
+        pitch_components.for_each(|c| commands.entity(c.0).despawn());
+        pitch_changed_writer.send(PitchesChanged {})
+    }
+
+    let window = q_windows.single();
+    let window_width = window.width();
+    let window_height = window.height();
+
+    if let Some(position) = window.cursor_position() {
+        let ndc = coordinate_conversion::screen_to_ndc(position, window, 0.0);
+
+        let cam_transform = camera_transform.single();
+        let cam_projection = camera_projection.single();
+
+        let world_pos = coordinate_conversion::ndc_to_world(ndc, cam_transform, cam_projection);
+
+        if pitch_creation_state.is_adding_pitch {
+            let last_pitch = pitch_components.iter().last().unwrap().1;
+            last_pitch.frequency = position.x;
+            last_pitch.volume = position.y / window_height;
+        }
+
+        if buttons.just_pressed(MouseButton::Left) {
+            let pitch = Pitch {
+                frequency: position.x,
+                volume: position.y / window_height,
+                phase_accumulator: 0.0,
+            };
+            pitch_creation_state.is_adding_pitch = true;
+            commands.spawn((
+                pitch,
+                MaterialMesh2dBundle {
+                    mesh: meshes.add(shape::Circle::new(50.).into()).into(),
+                    material: materials.add(ColorMaterial::from(Color::RED)),
+                    transform: Transform::from_translation(Vec3::new(
+                        world_pos.x,
+                        world_pos.y,
+                        0.0,
+                    )),
+                    ..default()
+                },
+            ));
+            pitch_changed_writer.send(PitchesChanged {})
+        }
+        if buttons.just_released(MouseButton::Left) {
+            pitch_creation_state.is_adding_pitch = false;
+        }
+    }
+}
+
+fn setup_audio(audio_resource: Res<AudioResource>) {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("Failed to get audio device");
+
+    let mut supported_configs_range = device
+        .supported_output_configs()
+        .expect("error while querying configs");
+    let supported_config = supported_configs_range
+        .next()
+        .expect("no supported config?!")
+        .with_max_sample_rate();
+
+    let sample_rate: f32 = supported_config.sample_rate().0 as f32;
+
+    let audio_data = audio_resource.data.clone();
+
+    let stream = device
+        .build_output_stream(
+            &supported_config.into(),
+            move |raw_audio_data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                let mut audio_data = audio_data.lock().unwrap();
+                for sample in raw_audio_data.iter_mut() {
+                    *sample = 0.0;
+                    for pitch in audio_data.iter_mut() {
+                        *sample += pitch.sine_wave(sample_rate);
+                        pitch.advance(sample_rate);
+                    }
+                    *sample = *sample / (audio_data.pitches.iter().len() as f32);
+                }
+            },
+            move |_err| {},
+            None,
+        )
+        .expect("Failed to create stream");
+
+    stream.play().expect("Failed to play");
+}
+
+fn main() {
+    let data = Arc::new(Mutex::new(AudioData {
+        pitches: vec![],
+        is_adding_pitch: false,
+    }));
+
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_event::<PitchesChanged>()
+        .insert_resource(AudioResource { data: data.clone() })
+        .add_systems(Startup, setup)
+        .add_systems(Startup, setup_audio)
+        .add_systems(Update, handle_mouse)
+        .add_systems(Update, keep_pitches_in_sync)
+        .run();
+}
