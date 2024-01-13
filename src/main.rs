@@ -153,7 +153,7 @@ fn handle_mouse(
                 pitch_id.clone(),
                 AddingPitch {},
                 MaterialMesh2dBundle {
-                    mesh: meshes.add(shape::Circle::new(50.).into()).into(),
+                    mesh: meshes.add(shape::Circle::new(20.).into()).into(),
                     material: materials.add(ColorMaterial::from(Color::RED)),
                     transform: Transform::from_translation(Vec3::new(
                         world_pos.x,
@@ -174,17 +174,8 @@ fn handle_mouse(
 }
 
 fn main() {
-    // plot_pitch(
-    //     &Pitch::Sine {
-    //         frequency: 440.0,
-    //         volume: 1.0,
-    //     },
-    //     24_000.0,
-    // )
-    // .unwrap();
-    // panic!("End");
-    let original_audio_data = Arc::new(Mutex::new(AudioData(HashMap::new())));
-    let audio_data = original_audio_data.clone();
+    let original_pitches = Arc::new(Mutex::new(AudioData(HashMap::new())));
+    let pitches = original_pitches.clone();
 
     let host = cpal::default_host();
     let device = host
@@ -208,11 +199,11 @@ fn main() {
         .build_output_stream(
             &supported_config.into(),
             move |raw_audio_data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                let mut audio_data = audio_data.lock().unwrap();
+                let mut pitches = pitches.lock().unwrap();
                 let mut phase_accumulators = phase_accumulators_clone.0.lock().unwrap();
                 for sample in raw_audio_data.iter_mut() {
                     *sample = 0.0;
-                    for (id, pitch) in audio_data.0.iter_mut() {
+                    for (id, pitch) in pitches.0.iter_mut() {
                         let phase_accumulator = phase_accumulators.get_mut(id).unwrap();
                         *sample += pitch.wave(phase_accumulator, sample_rate);
                         if *sample > 1.0 {
@@ -220,7 +211,7 @@ fn main() {
                         }
                         pitch.advance(phase_accumulator, sample_rate);
                     }
-                    *sample = *sample / (audio_data.0.iter().len() as f32);
+                    *sample = *sample / (pitches.0.iter().len() as f32);
                 }
             },
             move |err| {
@@ -235,7 +226,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_event::<PitchesChanged>()
-        .insert_resource(AudioResource(original_audio_data.clone()))
+        .insert_resource(AudioResource(original_pitches.clone()))
         .insert_resource(phase_accumulators.clone())
         .add_systems(Startup, setup)
         .add_systems(Update, handle_mouse)
@@ -243,14 +234,4 @@ fn main() {
         .run();
 }
 
-
-// Basic Harmonics example
-// for multiplier in 2..4 {
-//     let harmonic_pitch_id = PitchId::new();
-//     pitch_changed_writer.send(PitchesChanged::Add(harmonic_pitch_id.clone(), 
-//         match p.1 {
-//             Pitch::Sine { frequency, volume } => Pitch::Sine {frequency: frequency * multiplier as f32, volume: volume / multiplier as f32 }
-//         }
-//     ));
-// }
 
